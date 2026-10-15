@@ -1,0 +1,7 @@
+bin/
+node_modules/
+eval/
+legacy/
+reports/
+research_notes/
+.DS_Store

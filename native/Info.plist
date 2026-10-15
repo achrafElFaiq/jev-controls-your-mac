@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>dev.jev.helper</string>
+  <key>CFBundleName</key><string>jevhelper</string>
+  <key>NSMicrophoneUsageDescription</key><string>Jev listens to your voice commands.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Jev turns your voice into commands, on your Mac.</string>
+</dict>
+</plist>
