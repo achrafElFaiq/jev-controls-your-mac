@@ -1,7 +1,7 @@
 {
   "name": "jev",
-  "version": "0.3.0",
-  "description": "Control your Mac by voice: fixed commands for apps, websites, keys and scrolling, matched in plain code. No model.",
+  "version": "0.4.0",
+  "description": "Control your Mac by voice: fixed commands for apps, websites, keys and scrolling, and clicking anything on screen by name, in plain code. No model.",
   "type": "module",
   "bin": {
     "jev": "src/cli.js"

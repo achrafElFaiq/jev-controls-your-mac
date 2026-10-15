@@ -63,7 +63,14 @@ export class Desktop extends EventEmitter {
     try {
       const page = await this.web.snapshot(native.app, { maxElements: opts.maxElements ?? 200 });
       this.browser = native.app;
-      const chrome = native.elements.filter((e) => e.role !== 'AXMenuBarItem').slice(0, 40);
+      // The browser's own buttons and tabs, once each (its toolbar can be listed twice).
+      const seen = new Set();
+      const chrome = native.elements.filter((e) => {
+        const key = `${e.role}|${e.label}`;
+        if (e.role === 'AXMenuBarItem' || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }).slice(0, 40);
       return { ...native, url: page.url, elements: [...page.elements, ...chrome], text: `Page: ${page.title} (${page.url})\n${page.text}` };
     } catch (err) {
       return { ...native, text: `(Can't read the web page: ${err.message})\n${native.text}` };

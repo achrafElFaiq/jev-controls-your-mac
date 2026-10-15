@@ -175,7 +175,8 @@ func descendantText(_ el: AXUIElement, depth: Int = 0, budget: inout Int) -> Str
   let values = attrs(el, ["AXRole", "AXValue", "AXTitle", "AXDescription", "AXChildren"])
   var parts: [String] = []
   let role = str(values[0]) ?? ""
-  if textRoles.contains(role) || role == "AXImage" {
+  // A row's own name can sit in a text field (Finder's file names).
+  if textRoles.contains(role) || role == "AXImage" || role == "AXTextField" {
     if let t = str(values[1]) ?? str(values[2]) ?? str(values[3]) { parts.append(t) }
   }
   for child in (values[4] as? [AXUIElement]) ?? [] {

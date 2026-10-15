@@ -1,10 +1,12 @@
 // Turns one spoken command into one action, in plain code: no model of any kind.
 //
-//   you say ──► matched against fixed phrasings, installed apps and known websites
-//           ──► the action runs (~0.1 s) ──► chime
+//   you say ──► level 1: fixed phrasings, installed apps, known websites (no screen read)
+//           ──► level 2: "click <name>": the names on screen, compared as text
+//           ──► the action runs ──► chime
 //
-// Anything that isn't a known command does nothing: "Sorry, I didn't get that."
+// Anything else does nothing: "Sorry, I didn't get that."
 import { Sandbox } from './sandbox.js';
+import { byPosition, continued, findTargets, nameOf, ordinal, parseClick } from './click.js';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { HOME } from './config.js';
@@ -12,12 +14,21 @@ import { KEYS, MODIFYING_KEYS, RISKY_KEYS, placeCandidates, splitCommands } from
 import { extendable, matchFixed } from './fixed.js';
 import { isBrowser } from './web.js';
 
-// A screen read is reused for this long (for the sandbox check and "see").
+// A screen read is reused for this long, unless it was taken right after an action
+// (pages keep changing for a moment after a click).
 const CACHE_MS = 2500;
+const SETTLE_MS = 800;
+// When the name isn't on screen yet (a page still loading), look again this often, this many times.
+const RETRY_MS = 400;
+const RETRIES = 3;
 // The window/tab list changes rarely: reuse it for this long while refreshing in the background.
 const WINDOWS_MS = 1500;
 const UNKNOWN = "Sorry, I didn't get that.";
 const DECLINED = 'Okay, I left it.';
+
+// Buttons whose click can't be undone: they ask first unless the user said that word.
+export const CLICK_RISK = /\b(send|submit|pay|purchase|buy|order|checkout|delete|remove|trash|post|publish|transfer|book|reserve|subscribe|unsubscribe|sign up|register|apply|donate|confirm|envoyer|supprimer|payer|valider|postuler|commander|publier|acheter|reserver)\b/i;
+const SAYS_RISKY = /\b(send|submit|post|publish|pay|purchase|buy|order|book|reserve|delete|remove|trash|subscribe|unsubscribe|sign up|register|apply|donate|confirm|envoie|envoyer|valide|valider|supprime|supprimer|paye|payer|postule|postuler|commande|commander|publie|publier|achete|acheter|reserve|reserver)/i;
 
 const GROUPS = [
   ['Buttons', /Button|MenuButton|PopUpButton|Toggle|Switch|DisclosureTriangle/],
@@ -62,7 +73,10 @@ export class Commander {
     this.sandbox = sandbox ?? (config.sandbox ? new Sandbox({ root: config.sandbox, desktop }) : null);
     this.apps = apps;
     this.cache = null;
+    this.lastActionAt = 0;
     this.windowCache = null;
+    // The latest screen read, for deciding while the user is still speaking.
+    this.lastScreen = null;
     // The sandbox's folder and file names: an "open X" that could mean one of these isn't
     // run, since it may not be the app or website the user meant.
     this.placeNames = [];
@@ -81,15 +95,31 @@ export class Commander {
     return Promise.resolve(this.windowCache.list);
   }
 
-  /** Reads the screen (when the user starts speaking, or for "see"). */
+  /** Reads the screen (while the user speaks, for clicks, or for "see"). */
   prefetch() {
-    if (this.cache && Date.now() - this.cache.at < CACHE_MS) return this.cache.promise;
+    const usable = this.cache && Date.now() - this.cache.at < CACHE_MS && this.cache.at - this.lastActionAt > SETTLE_MS;
+    if (usable) return this.cache.promise;
+    const at = Date.now();
     const promise = this.desktop.snapshot({ maxElements: this.config.maxElements ?? 200 }).catch((err) => ({ app: '', window: '', elements: [], text: '', error: err.message }));
-    this.cache = { at: Date.now(), promise };
+    this.cache = { at, promise };
+    promise.then((screen) => {
+      if (screen.error) return;
+      this.lastScreen = { at, screen };
+      this.onScreen?.(screen);
+    });
     return promise;
   }
 
-  invalidate() { this.cache = null; }
+  invalidate() {
+    this.cache = null;
+    this.lastActionAt = Date.now();
+  }
+
+  /** A screen read taken after the last action settled, and recent: what's on screen now. */
+  freshScreen() {
+    const s = this.lastScreen;
+    return s && Date.now() - s.at < CACHE_MS && s.at - this.lastActionAt > SETTLE_MS ? s.screen : null;
+  }
 
   async installedApps() {
     this.apps ??= await this.desktop.request('installed_apps').catch(() => []);
@@ -114,6 +144,19 @@ export class Commander {
   fixedNow(command) {
     const f = this.fixed(command);
     return f && f.key !== 'quit_app' && !extendable(command, { apps: this.apps ?? [] }) ? f : null;
+  }
+
+  /**
+   * A click that can run before the sentence ends: the screen was just read, exactly one
+   * thing has that name, no other name continues it ("Save" vs "Save as draft"), and it
+   * isn't a button that can't be undone.
+   */
+  clickNow(command) {
+    const c = parseClick(command);
+    const screen = this.freshScreen();
+    if (!c || !screen || this.fixed(command)) return false;
+    const { matches, exact } = findTargets(c.targets, screen.elements);
+    return exact && matches.length === 1 && !continued(nameOf(matches[0].label), screen.elements) && !CLICK_RISK.test(matches[0].label);
   }
 
   /** Runs everything the user said ("open Brave then go to LinkedIn" is two commands). */
@@ -148,7 +191,10 @@ export class Commander {
       await this.installedApps();
       this.refreshPlaces();
       const f = this.fixed(command);
-      if (!f) return this.fail(m, t0, UNKNOWN);
+      if (!f) {
+        const click = parseClick(command);
+        return click ? await this.runClick(click, command, m, t0) : this.fail(m, t0, UNKNOWN);
+      }
       Object.assign(m, { op: f.op, target: f.key ?? f.scroll ?? f.app ?? f.site });
       this.ui.log('action', `${m.op} → ${m.target}`);
       const ta = performance.now();
@@ -161,6 +207,64 @@ export class Commander {
     } catch (err) {
       return this.fail(m, t0, `Sorry, ${err.message}`);
     }
+  }
+
+  /** Level 2: find the named thing on screen and click it. */
+  async runClick({ target, targets, mode, state }, command, m, t0) {
+    m.op = 'click';
+    let found = { matches: [] };
+    let screen;
+    // Not there yet (a page still loading after the last command): look again a few times.
+    for (let i = 0; i <= RETRIES; i++) {
+      if (i) {
+        await new Promise((r) => setTimeout(r, RETRY_MS));
+        this.cache = null;
+      }
+      screen = await this.prefetch();
+      found = findTargets(targets, screen.elements);
+      if (found.matches.length) break;
+    }
+    m.screenMs = performance.now() - t0;
+    if (!found.matches.length) return this.fail(m, t0, `I don't see ${target} on the screen.`);
+
+    let element = found.matches[0];
+    if (found.matches.length > 1) {
+      element = await this.whichOne(target, found.matches);
+      if (!element) return this.fail(m, t0, DECLINED);
+    }
+    m.target = `${element.role.replace(/^AX/, '')} "${element.label}"`;
+    this.ui.log('action', `click → ${m.target}`);
+    // A checkbox already in the asked state stays as it is.
+    if (state !== undefined && /CheckBox|Switch/.test(element.role) && (element.value === '1') === state) return this.finish(m, t0);
+    if (CLICK_RISK.test(element.label) && !SAYS_RISKY.test(this.userWords ?? command)) {
+      if (!(await this.confirm(`That's "${element.label}". Do it?`))) return this.fail(m, t0, DECLINED);
+    }
+    const ta = performance.now();
+    try {
+      await this.desktop.press(element.id, mode);
+    } catch (err) {
+      // The page changed between reading and clicking: say so rather than clicking something else.
+      if (/is gone|Unknown element/.test(err.message)) return this.fail(m, t0, `${target} moved before I could click it. Say it again.`);
+      throw err;
+    }
+    m.actionMs = performance.now() - ta;
+    return this.finish(m, t0);
+  }
+
+  finish(m, t0) {
+    this.invalidate();
+    m.totalMs = performance.now() - t0;
+    return m;
+  }
+
+  /** Several things have that name: list them top to bottom and ask which. */
+  async whichOne(target, matches) {
+    const list = matches.slice(0, 5).sort(byPosition);
+    const where = (e) => `${e.role.replace(/^AX/, '').toLowerCase()}${e.inDialog ? ' in the dialog' : ''}${e.offscreen ? ` further ${e.offscreen === 'below' ? 'down' : 'up'}` : ''}`;
+    this.ui.show?.(list.map((e, i) => `   ${i + 1}. ${where(e)} "${e.label}"`));
+    const reply = await this.ui.ask(`There are ${matches.length} ${target}. Which one: ${list.map((_, i) => ['first', 'second', 'third', 'fourth', 'fifth'][i]).join(', ')}?`);
+    const i = ordinal(String(reply), list.length);
+    return i == null ? null : list[i];
   }
 
   fail(m, t0, message) {

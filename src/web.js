@@ -83,6 +83,9 @@ function pageSnapshot(maxElements, maxText) {
     const d = distance(el);
     if (d > 0) item.offscreen = el.getBoundingClientRect().top > 0 ? 'below' : 'above';
     if (dialog && dialog.contains(el)) item.inDialog = true;
+    // Position on the page, to tell same-named elements apart ("the second one").
+    const r = el.getBoundingClientRect();
+    item.pos = [Math.round(r.left + scrollX), Math.round(r.top + scrollY)];
     elements.push(item);
   }
 

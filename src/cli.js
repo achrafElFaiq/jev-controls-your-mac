@@ -84,6 +84,7 @@ async function interactive({ voice }) {
   commander.installedApps();
 
   let running = Promise.resolve();
+  let busy = false;
   const onUtterance = (text) => {
     text = text.trim();
     if (!text) return;
@@ -97,40 +98,68 @@ async function interactive({ voice }) {
     console.log(c.bold(`you: ${text}`));
     if (answers.waiting) return answers.push(text);
     running = running.then(async () => {
-      // "see": print everything Jev can act on right now (no Jev call).
-      if (/^(see|:see|debug see)$/i.test(text)) {
-        commander.invalidate();
-        console.log(c.dim(listScreen(await commander.prefetch()).join('\n')));
-        return;
-      }
-      for (const r of await commander.handle(text)) {
-        console.log(c.dim(`  ${timing(r)}`));
-        if (r.status === 'done') chime();
-      }
+      busy = true;
+      try { await runOne(text); } finally { busy = false; }
     });
+  };
+  const runOne = async (text) => {
+    // "see": print everything Jev can act on right now.
+    if (/^(see|:see|debug see)$/i.test(text)) {
+      commander.invalidate();
+      console.log(c.dim(listScreen(await commander.prefetch()).join('\n')));
+      return;
+    }
+    for (const r of await commander.handle(text)) {
+      console.log(c.dim(`  ${timing(r)}`));
+      if (r.status === 'done') chime();
+    }
   };
 
   if (voice) {
-    // A fixed command ("open Brave", "new tab") runs as soon as the words stop changing for
-    // `early` ms, without waiting for the end-of-speech silence. Set "early": 0 to turn off.
+    // A command that more words can't change ("open Brave", "click Jobs" when exactly one
+    // Jobs is on screen) runs as soon as the words stop changing for `early` ms, without
+    // waiting for the end-of-speech silence. Set "early": 0 to turn off.
     const earlyMs = config.early ?? 300;
     let earlyTimer = null;
     let ranEarly = null; // { text, at }: the end of that sentence must not run it again
+    let partial = null; // { text, at } while the user is speaking
+    const considerEarly = () => {
+      clearTimeout(earlyTimer);
+      if (!partial || earlyMs <= 0 || answers.waiting) return;
+      const { text } = partial;
+      if (!commander.fixedNow(text) && !commander.clickNow(text)) return;
+      earlyTimer = setTimeout(() => {
+        ranEarly = { text: normalize(text), at: Date.now() };
+        partial = null;
+        desktop.listenReset().catch(() => {});
+        stdout.write('\r\x1b[2K');
+        onUtterance(text);
+      }, Math.max(0, earlyMs - (Date.now() - partial.at)));
+    };
     desktop.on('partial', ({ text }) => {
       if (speaker.speaking) return;
       stdout.write(`\r\x1b[2K${c.dim(text)}`);
-      clearTimeout(earlyTimer);
-      if (earlyMs > 0 && !answers.waiting && commander.fixedNow(text)) {
-        earlyTimer = setTimeout(() => {
-          ranEarly = { text: normalize(text), at: Date.now() };
-          desktop.listenReset().catch(() => {});
-          stdout.write('\r\x1b[2K');
-          onUtterance(text);
-        }, earlyMs);
-      }
+      partial = { text, at: Date.now() };
+      // Read the screen while the user is still talking, unless it's a fixed command.
+      if (!commander.fixed(text)) commander.prefetch();
+      considerEarly();
     });
+    // Names on screen are words the recognizer should expect ("Candidature simplifiée").
+    const baseHints = speechHints(await commander.installedApps());
+    let lastHints = '';
+    commander.onScreen = (screen) => {
+      if (partial) considerEarly(); // the screen arrived after the last words
+      const labels = [...new Set((screen.elements ?? []).map((e) => e.label).filter((l) => l && l.length <= 40))].slice(0, 150);
+      const key = labels.join('|');
+      if (key === lastHints) return;
+      lastHints = key;
+      desktop.request('listen_hints', { hints: [...labels, ...baseHints] }).catch(() => {});
+    };
+    // Keep the screen read fresh while idle, so names are known before the next command.
+    setInterval(() => { if (!busy && !partial && !speaker.speaking) commander.prefetch(); }, 4000).unref();
     desktop.on('utterance', ({ text }) => {
       clearTimeout(earlyTimer);
+      partial = null;
       stdout.write('\r\x1b[2K');
       // The same sentence, finished after it already ran early: run only what came after.
       if (ranEarly && Date.now() - ranEarly.at < 3000) {
@@ -145,8 +174,8 @@ async function interactive({ voice }) {
       onUtterance(text);
     });
     desktop.on('listen_error', ({ error }) => console.log(c.red(`mic: ${error}`)));
-    const hints = speechHints(await commander.installedApps());
-    await desktop.listen(true, { locale: config.locale, silence: config.silence, hints });
+    await desktop.listen(true, { locale: config.locale, silence: config.silence, hints: baseHints });
+    commander.prefetch();
     console.log(c.green('Listening. Say a command. Ctrl+C to quit.'));
     chime('Pop');
   } else {
