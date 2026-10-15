@@ -1,7 +1,7 @@
 {
   "name": "jev",
-  "version": "0.4.0",
-  "description": "Control your Mac by voice: fixed commands for apps, websites, keys and scrolling, and clicking anything on screen by name, in plain code. No model.",
+  "version": "0.5.0",
+  "description": "Control your Mac by voice: fixed commands for apps, websites, keys and scrolling, clicking anything on screen by name, and Jev to understand what was meant when the exact words aren't found. No model.",
   "type": "module",
   "bin": {
     "jev": "src/cli.js"
@@ -13,6 +13,7 @@
     "build": "sh native/build.sh && sh test/fixture/build.sh",
     "test": "node --test test/*.test.js",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.js",
-    "start": "node src/cli.js"
+    "start": "node src/cli.js",
+    "eval:jev": "node scripts/eval-jev.js"
   }
 }

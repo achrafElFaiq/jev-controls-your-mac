@@ -226,14 +226,129 @@ test('level 1 comes first: keys and apps never read the screen', async () => {
   assert.equal(desktop.snapshots, 0);
 });
 
-test('early click: only with a fresh screen, one exact match, nothing continuing it, nothing risky', async () => {
-  const { commander } = setup({ elements: [...ELEMENTS, { id: 'w20', role: 'AXButton', label: 'Save', pos: [0, 0] }, { id: 'w21', role: 'AXButton', label: 'Save as draft', pos: [0, 0] }] });
-  assert.equal(commander.clickNow('click jobs'), false, 'no screen read yet');
+test('without a Jev answer, no early click', async () => {
+  const { commander } = setup();
+  assert.equal(commander.clickNow('click jobs'), false, 'no Jev answer yet');
+});
+
+// ---- Jev: decides every command about the screen ----
+
+function withJev(decide, opts = {}) {
+  const calls = [];
+  const s = setup(opts);
+  s.commander.jev = true;
+  s.commander.understandFn = async ({ command, screen }) => {
+    calls.push(command);
+    const d = decide(command, screen);
+    return { score: 0.9, top: [], action: d?.op ?? 'none', ...d, op: d?.op ?? null };
+  };
+  return { ...s, calls };
+}
+const byLabel = (l) => ELEMENTS.find((e) => e.label === l);
+
+test('Jev decides exact names too', async () => {
+  const { commander, desktop, calls } = withJev(() => ({ op: 'click', element: byLabel('Jobs') }));
+  await commander.handle('click jobs');
+  assert.deepEqual(calls, ['click jobs']);
+  assert.deepEqual(desktop.log, [['press', 'w1', undefined]]);
+});
+
+test('Jev not sure, but one element has exactly that name: clicked by the code', async () => {
+  const { commander, desktop } = withJev(() => null);
+  const [r] = await commander.handle('click jobs');
+  assert.equal(r.path, 'click');
+  assert.deepEqual(desktop.log, [['press', 'w1', undefined]]);
+});
+
+test('Jev unreachable: the exact-name code takes over', async () => {
+  const s2 = setup();
+  s2.commander.jev = true;
+  s2.commander.understandFn = async () => { throw new Error('network down'); };
+  const [r] = await s2.commander.handle('click jobs');
+  assert.equal(r.status, 'done');
+  assert.deepEqual(s2.desktop.log, [['press', 'w1', undefined]]);
+});
+
+test('early run: once Jev answered for these words on this screen, sure and safe', async () => {
+  const { commander } = withJev((cmd) => (cmd === 'clique sur offres' ? { op: 'click', element: byLabel('Jobs') } : { op: 'click', element: byLabel('Send') }));
   commander.lastActionAt = 0;
   await commander.prefetch();
-  assert.equal(commander.clickNow('click jobs'), true);
-  assert.equal(commander.clickNow('click reply'), false, 'two of them');
-  assert.equal(commander.clickNow('click save'), false, 'may become "save as draft"');
-  assert.equal(commander.clickNow('click send'), false, 'cannot be undone');
-  assert.equal(commander.clickNow('click easy apply'), false, 'not an exact name');
+  commander.speculate('clique sur offres');
+  assert.equal(commander.clickNow('clique sur offres'), false, 'answer not back yet');
+  await commander.speculation.promise;
+  assert.equal(commander.clickNow('clique sur offres'), true);
+  assert.equal(commander.clickNow('clique sur offres d emploi'), false, 'other words');
+  commander.speculate('click send');
+  await commander.speculation.promise;
+  assert.equal(commander.clickNow('click send'), false, 'cannot be undone: waits for the end');
+});
+
+test('no exact name: Jev picks what was meant, without asking', async () => {
+  const { commander, desktop, calls, asked } = withJev(() => ({ op: 'click', element: byLabel('Messaging 3') }));
+  const [r] = await commander.handle('clique sur mes messages');
+  assert.equal(r.status, 'done');
+  assert.equal(r.path, 'jev');
+  assert.deepEqual(calls, ['clique sur mes messages']);
+  assert.deepEqual(asked, []);
+  assert.deepEqual(desktop.log, [['press', 'w2', undefined]]);
+});
+
+test('not a click at all: Jev can open an app, go to a site, press a key or scroll', async () => {
+  const decisions = { 'fire up brave': { op: 'open_app', app: 'Brave Browser' }, 'mets youtube': { op: 'open_site', site: 'youtube.com' }, 'mets la page a jour': { op: 'key', key: 'reload' }, 'va plus bas': { op: 'scroll', scroll: 'down' } };
+  const { commander, desktop } = withJev((cmd) => decisions[cmd]);
+  for (const cmd of Object.keys(decisions)) assert.equal((await commander.handle(cmd))[0].status, 'done', cmd);
+  assert.deepEqual(desktop.log, [['openApp', 'Brave Browser'], ['openUrl', 'https://youtube.com', 'Brave Browser'], ['keys', 'cmd+r', 'Brave Browser'], ['scroll', 'down']]);
+});
+
+test('Jev not sure: nothing happens, no question', async () => {
+  const { commander, desktop, asked, said, calls } = withJev(() => null);
+  const [r] = await commander.handle('achete un billet pour lyon');
+  assert.equal(r.status, 'failed');
+  assert.equal(calls.length, 1, 'not about the screen: asked once, no second look');
+  assert.deepEqual(desktop.log, []);
+  assert.deepEqual(asked, []);
+  assert.match(said[0], /didn't get that/);
+});
+
+test('a click Jev is not sure about: looks again (page loading), then "I don\'t see"; Jev only again if the screen changed', async () => {
+  const { commander, desktop, calls, said } = withJev(() => null);
+  await commander.handle('click banana');
+  assert.equal(calls.length, 1, 'same screen: Jev asked once');
+  assert.match(said[0], /I don't see banana/);
+  assert.deepEqual(desktop.log, []);
+});
+
+test('Jev down: the command fails cleanly', async () => {
+  const s = setup();
+  s.commander.jev = true;
+  s.commander.understandFn = async () => { throw new Error('Jev request failed (500)'); };
+  const [r] = await s.commander.handle('mets la page a jour');
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(s.desktop.log, []);
+});
+
+test('a button that cannot be undone, picked by Jev, still asks first', async () => {
+  const { commander, desktop, asked } = withJev(() => ({ op: 'click', element: byLabel('Delete account') }), { answers: ['no'] });
+  await commander.handle('click the red one at the bottom');
+  assert.match(asked[0], /Delete account/);
+  assert.deepEqual(desktop.log, []);
+});
+
+test('the answer asked while speaking is reused: one Jev call, ready early', async () => {
+  const { commander, calls } = withJev(() => ({ op: 'click', element: byLabel('Jobs') }));
+  commander.lastActionAt = 0;
+  await commander.prefetch();
+  commander.speculate('clique sur offres');
+  const [r] = await commander.handle('clique sur offres');
+  assert.equal(calls.length, 1);
+  assert.equal(r.understood.early, true);
+});
+
+test('no Jev key: Jev never runs', async () => {
+  const s = setup();
+  let called = false;
+  s.commander.understandFn = async () => { called = true; };
+  await s.commander.handle('clique sur mes messages');
+  await s.commander.handle('fire up brave');
+  assert.equal(called, false);
 });

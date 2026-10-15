@@ -104,11 +104,41 @@ function pageSnapshot(maxElements, maxText) {
 }
 
 function pageScroll(direction) {
-  const amount = { up: -0.8, down: 0.8 }[direction];
-  if (amount) scrollBy({ top: innerHeight * amount, behavior: 'instant' });
-  else if (direction === 'left' || direction === 'right') scrollBy({ left: (direction === 'left' ? -0.8 : 0.8) * innerWidth, behavior: 'instant' });
-  const max = document.documentElement.scrollHeight - innerHeight;
-  return JSON.stringify({ result: `scrolled ${direction} (${max > 0 ? Math.round((scrollY / max) * 100) : 100}% down the page)` });
+  // Many sites (LinkedIn, Gmail…) scroll an inner panel, not the window: scroll the panel the
+  // user is looking at (under the middle of the view), else the largest one, else the window.
+  const vertical = direction === 'up' || direction === 'down';
+  const sign = direction === 'up' || direction === 'left' ? -1 : 1;
+  const canScroll = (el) => {
+    if (!el || el === document.body || el === document.documentElement) return false;
+    const s = getComputedStyle(el);
+    const overflow = vertical ? s.overflowY : s.overflowX;
+    const room = vertical ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth;
+    return /(auto|scroll|overlay)/.test(overflow) && room > 10;
+  };
+  const windowRoom = vertical ? document.documentElement.scrollHeight - innerHeight : document.documentElement.scrollWidth - innerWidth;
+  let target = null;
+  for (let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2); el; el = el.parentElement) {
+    if (canScroll(el)) { target = el; break; }
+  }
+  if (!target && windowRoom <= 10) {
+    let best = 0;
+    for (const el of document.querySelectorAll('*')) {
+      if (!canScroll(el)) continue;
+      const r = el.getBoundingClientRect();
+      const area = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)) * Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+      if (area > best) { best = area; target = el; }
+    }
+  }
+  if (!target && windowRoom <= 10) return JSON.stringify({ error: 'Nothing on this page scrolls' });
+  const box = target ? target.getBoundingClientRect() : null;
+  const step = sign * 0.8 * (vertical ? (box ? Math.min(box.height, innerHeight) : innerHeight) : (box ? Math.min(box.width, innerWidth) : innerWidth));
+  const scroller = target || document.scrollingElement || document.documentElement;
+  const before = vertical ? scroller.scrollTop : scroller.scrollLeft;
+  (target || window).scrollBy(vertical ? { top: step, behavior: 'instant' } : { left: step, behavior: 'instant' });
+  const after = vertical ? scroller.scrollTop : scroller.scrollLeft;
+  const max = vertical ? scroller.scrollHeight - scroller.clientHeight : scroller.scrollWidth - scroller.clientWidth;
+  const where = max > 0 ? `${Math.round((after / max) * 100)}%` : '100%';
+  return JSON.stringify({ result: after === before ? `already at the ${sign > 0 ? 'end' : 'start'}` : `scrolled ${direction} (${where})`, panel: !!target });
 }
 
 function pageText(maxChars) {
@@ -187,7 +217,9 @@ export class Web {
   }
 
   async scroll(app, direction) {
-    return JSON.parse(await this.run(app, call(pageScroll, direction))).result;
+    const out = JSON.parse(await this.run(app, call(pageScroll, direction)));
+    if (out.error) throw new Error(out.error);
+    return out.result;
   }
 
   async action(app, action) {

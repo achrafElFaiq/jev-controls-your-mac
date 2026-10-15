@@ -2,15 +2,17 @@
 //
 //   you say ──► level 1: fixed phrasings, installed apps, known websites (no screen read)
 //           ──► level 2: "click <name>": the names on screen, compared as text
+//           ──► nothing found: Jev works out what was meant (one call, asked while you speak)
 //           ──► the action runs ──► chime
 //
-// Anything else does nothing: "Sorry, I didn't get that."
+// When Jev isn't sure either, nothing happens: "Sorry, I didn't get that."
 import { Sandbox } from './sandbox.js';
-import { byPosition, continued, findTargets, nameOf, ordinal, parseClick } from './click.js';
+import { understand as defaultUnderstand } from './understand.js';
+import { byPosition, findTargets, ordinal, parseClick } from './click.js';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { HOME } from './config.js';
-import { KEYS, MODIFYING_KEYS, RISKY_KEYS, placeCandidates, splitCommands } from './commands.js';
+import { KEYS, MODIFYING_KEYS, RISKY_KEYS, normalize, placeCandidates, splitCommands } from './commands.js';
 import { extendable, matchFixed } from './fixed.js';
 import { isBrowser } from './web.js';
 
@@ -68,8 +70,12 @@ export class Commander {
    * @param deps.ui       { say(text), ask(question) -> reply, log(kind, text) }
    * @param deps.config   { browser, sandbox, maxElements, log }
    */
-  constructor({ desktop, ui, config, sandbox, apps = null }) {
-    Object.assign(this, { desktop, ui, config });
+  constructor({ desktop, ui, config, sandbox, apps = null, understand = defaultUnderstand }) {
+    Object.assign(this, { desktop, ui, config, understandFn: understand });
+    // Jev is used only when a key is set; without it, Jev never runs.
+    this.jev = !!config.jevKey;
+    // A Jev answer requested while the user was still speaking: { key, promise }.
+    this.speculation = null;
     this.sandbox = sandbox ?? (config.sandbox ? new Sandbox({ root: config.sandbox, desktop }) : null);
     this.apps = apps;
     this.cache = null;
@@ -104,6 +110,7 @@ export class Commander {
     this.cache = { at, promise };
     promise.then((screen) => {
       if (screen.error) return;
+      screen.readAt = at;
       this.lastScreen = { at, screen };
       this.onScreen?.(screen);
     });
@@ -147,16 +154,17 @@ export class Commander {
   }
 
   /**
-   * A click that can run before the sentence ends: the screen was just read, exactly one
-   * thing has that name, no other name continues it ("Save" vs "Save as draft"), and it
-   * isn't a button that can't be undone.
+   * A screen command that can run before the sentence ends: Jev already answered for these
+   * exact words on the current screen, it's sure, it's one element, and it isn't a button
+   * that can't be undone.
    */
   clickNow(command) {
-    const c = parseClick(command);
+    const spec = this.speculation;
     const screen = this.freshScreen();
-    if (!c || !screen || this.fixed(command)) return false;
-    const { matches, exact } = findTargets(c.targets, screen.elements);
-    return exact && matches.length === 1 && !continued(nameOf(matches[0].label), screen.elements) && !CLICK_RISK.test(matches[0].label);
+    if (!spec || !screen || spec.key !== `${normalize(command)}|${screen.readAt}` || !spec.result?.op) return false;
+    const d = spec.result;
+    if (d.op !== 'click') return d.op !== 'key' || !RISKY_KEYS.has(d.key);
+    return (d.elements ?? [d.element]).length === 1 && !CLICK_RISK.test(d.element.label);
   }
 
   /** Runs everything the user said ("open Brave then go to LinkedIn" is two commands). */
@@ -167,7 +175,7 @@ export class Commander {
     for (const part of splitCommands(utterance)) {
       const r = await this.run(part);
       results.push(r);
-      this.record(r);
+      await this.record(r);
       if (r.status !== 'done') break;
     }
     return results;
@@ -177,8 +185,8 @@ export class Commander {
   async record(r) {
     if (this.config.log === false) return;
     const dir = join(HOME, 'logs');
-    const line = { at: new Date().toISOString(), command: r.command, status: r.status, op: r.op, target: r.target, error: r.error,
-      totalMs: Math.round(r.totalMs ?? 0), actionMs: Math.round(r.actionMs ?? 0) };
+    const line = { at: new Date().toISOString(), command: r.command, status: r.status, path: r.path ?? (r.op ? 'fixed' : undefined), op: r.op, target: r.target, error: r.error,
+      understood: r.understood, totalMs: Math.round(r.totalMs ?? 0), jevMs: r.jevMs ? Math.round(r.jevMs) : undefined, actionMs: Math.round(r.actionMs ?? 0) };
     await mkdir(dir, { recursive: true }).catch(() => {});
     await appendFile(join(dir, `${line.at.slice(0, 10)}.jsonl`), `${JSON.stringify(line)}\n`).catch(() => {});
   }
@@ -191,10 +199,7 @@ export class Commander {
       await this.installedApps();
       this.refreshPlaces();
       const f = this.fixed(command);
-      if (!f) {
-        const click = parseClick(command);
-        return click ? await this.runClick(click, command, m, t0) : this.fail(m, t0, UNKNOWN);
-      }
+      if (!f) return await this.runScreen(command, m, t0);
       Object.assign(m, { op: f.op, target: f.key ?? f.scroll ?? f.app ?? f.site });
       this.ui.log('action', `${m.op} → ${m.target}`);
       const ta = performance.now();
@@ -209,30 +214,136 @@ export class Commander {
     }
   }
 
-  /** Level 2: find the named thing on screen and click it. */
-  async runClick({ target, targets, mode, state }, command, m, t0) {
-    m.op = 'click';
-    let found = { matches: [] };
-    let screen;
-    // Not there yet (a page still loading after the last command): look again a few times.
+  /**
+   * Commands that need the screen. With a Jev key, Jev always decides what was meant (exact
+   * name or not). The code's exact-name match is the fallback: when Jev is unreachable, or
+   * when Jev isn't sure but exactly one element has the very name said. Nothing yet (a page
+   * still loading)? Look again.
+   */
+  async runScreen(command, m, t0) {
+    const click = parseClick(command);
+    if (!click && !this.jev) return this.fail(m, t0, UNKNOWN);
+    let asked = null;
+    let jevDown = !this.jev;
     for (let i = 0; i <= RETRIES; i++) {
       if (i) {
         await new Promise((r) => setTimeout(r, RETRY_MS));
         this.cache = null;
       }
-      screen = await this.prefetch();
-      found = findTargets(targets, screen.elements);
-      if (found.matches.length) break;
+      const screen = await this.prefetch();
+      m.screenMs = performance.now() - t0;
+      const found = click ? findTargets(click.targets, screen.elements) : { matches: [], exact: false };
+      // Jev again only if the screen changed since it last looked (a page that finished loading).
+      const names = (screen.elements ?? []).map((e) => e.label).join('|');
+      if (!jevDown && names !== asked) {
+        asked = names;
+        const d = await this.meaning(command, screen, m, found.exact ? found.matches : []);
+        if (d?.op) return this.act(d, click, command, m, t0);
+        if (d === null) jevDown = true;
+        // Jev isn't sure, but one element has exactly the name said: that one.
+        else if (found.exact && found.matches.length === 1) return this.click(found.matches[0], click, command, { ...m, path: 'click' }, t0);
+        // Jev sure it's not about the screen ("buy a ticket"): no point looking again.
+        else if (!click) break;
+      }
+      if (jevDown && found.matches.length) {
+        m.path = 'click';
+        let element = found.matches[0];
+        if (found.matches.length > 1) {
+          element = await this.whichOne(click.target, found.matches);
+          if (!element) return this.fail(m, t0, DECLINED);
+        }
+        return this.click(element, click, command, m, t0);
+      }
     }
-    m.screenMs = performance.now() - t0;
-    if (!found.matches.length) return this.fail(m, t0, `I don't see ${target} on the screen.`);
+    return this.fail(m, t0, click ? `I don't see ${click.target} on the screen.` : UNKNOWN);
+  }
 
-    let element = found.matches[0];
-    if (found.matches.length > 1) {
-      element = await this.whichOne(target, found.matches);
-      if (!element) return this.fail(m, t0, DECLINED);
+  /** What Jev understood, from the call made while the user spoke when it's for this screen. */
+  async meaning(command, screen, m, exact = []) {
+    const key = `${normalize(command)}|${screen.readAt}`;
+    const spec = this.speculation?.key === key ? this.speculation.promise : null;
+    const t = performance.now();
+    const d = await (spec ?? this.ask(command, screen, exact)).catch((err) => {
+      this.ui.log('jev', `Jev failed: ${err.message}`);
+      return null;
+    });
+    m.path = 'jev';
+    m.jevMs = (m.jevMs ?? 0) + (performance.now() - t);
+    if (d) m.understood = { action: d.action, op: d.op, score: Math.round(d.score * 100) / 100, top: d.top, early: !!spec };
+    if (d?.op) await this.remember(command, screen, d);
+    return d;
+  }
+
+  ask(command, screen, exact) {
+    const click = parseClick(command);
+    // The elements named exactly as said, for Jev to know (it still decides).
+    exact ??= click ? findTargets(click.targets, screen.elements).exact ? findTargets(click.targets, screen.elements).matches : [] : [];
+    return this.understandFn({ command, screen, apps: this.apps ?? [], config: this.config, isClick: !!click?.explicit, exact });
+  }
+
+  /**
+   * While the user is still speaking: if the words so far need Jev (no fixed command, no
+   * exact name on screen), ask now, so the answer is ready when they stop.
+   */
+  speculate(command) {
+    const screen = this.freshScreen();
+    if (!this.jev || !screen || this.fixed(command)) return;
+    const key = `${normalize(command)}|${screen.readAt}`;
+    if (this.speculation?.key === key) return;
+    const spec = { key, command: normalize(command), result: undefined };
+    spec.promise = this.ask(command, screen);
+    spec.promise.then((d) => { spec.result = d; this.onUnderstood?.(); }, () => {});
+    this.speculation = spec;
+  }
+
+  /** Runs what Jev understood. */
+  async act(d, click, command, m, t0) {
+    if (d.op === 'click') {
+      // Several elements with the name Jev chose: the open dialog, then what's in view, win;
+      // still several → ask which, as for exact names.
+      let list = d.elements ?? [d.element];
+      if (list.length > 1 && list.some((e) => e.inDialog)) list = list.filter((e) => e.inDialog);
+      if (list.length > 1 && list.some((e) => !e.offscreen)) list = list.filter((e) => !e.offscreen);
+      const rows = new Set(list.filter((e) => /Row/.test(e.role)).map((e) => e.label));
+      if (rows.size) list = list.filter((e) => !(/Cell/.test(e.role) && rows.has(e.label)));
+      let element = list[0];
+      if (list.length > 1) {
+        element = await this.whichOne(element.label, list);
+        if (!element) return this.fail(m, t0, DECLINED);
+      }
+      return this.click(element, click ?? {}, command, m, t0);
     }
+    Object.assign(m, { op: d.op, target: d.key ?? d.scroll ?? d.app ?? d.site });
+    this.ui.log('action', `${m.op} → ${m.target}`);
+    const ta = performance.now();
+    const done = await this.execute({ op: d.op, key: d.key, scroll: d.scroll, app: d.app, site: d.site }, command);
+    m.actionMs = performance.now() - ta;
+    return done === true ? this.finish(m, t0) : this.fail(m, t0, done);
+  }
+
+  /**
+   * Builds the dataset of what Jev understood: one line per command in
+   * ~/.jev/dataset/understood.jsonl, with the screen's names, to replay and measure later.
+   */
+  async remember(command, screen, d) {
+    if (this.config.log === false) return;
+    const line = {
+      at: new Date().toISOString(), command, app: screen.app, url: screen.url && new URL(screen.url).hostname,
+      chosen: d.element ? `${d.element.role.replace(/^AX/, '')} "${d.element.label}"` : d.app ?? d.site ?? d.key ?? d.scroll,
+      op: d.op, score: Math.round(d.score * 100) / 100, top: d.top,
+      screen: (screen.elements ?? []).filter((e) => e.label).slice(0, 200).map((e) => `${e.role.replace(/^AX/, '')} "${e.label}"`),
+    };
+    const dir = join(HOME, 'dataset');
+    await mkdir(dir, { recursive: true }).catch(() => {});
+    await appendFile(join(dir, 'understood.jsonl'), `${JSON.stringify(line)}\n`).catch(() => {});
+  }
+
+  /** Clicks an element (found by name or by Jev). */
+  async click(element, { target, mode, state } = {}, command, m, t0) {
+    m.op = 'click';
+    target ??= element.label;
     m.target = `${element.role.replace(/^AX/, '')} "${element.label}"`;
+    if (element.disabled) return this.fail(m, t0, `${element.label} is disabled.`);
     this.ui.log('action', `click → ${m.target}`);
     // A checkbox already in the asked state stays as it is.
     if (state !== undefined && /CheckBox|Switch/.test(element.role) && (element.value === '1') === state) return this.finish(m, t0);

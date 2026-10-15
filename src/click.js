@@ -43,7 +43,10 @@ export function parseClick(command) {
   // "tick"/"untick": the checkbox state wanted (left alone if it's already that way).
   const verb = v[3] ?? '';
   const state = /^(uncheck|untick|decoche)$/.test(verb) ? false : /^(tick|check|coche)$/.test(verb) ? true : undefined;
-  return t ? { target: t, targets: [...new Set([raw, t])], mode, state } : null;
+  // "click", "clique sur", "tick"…: certainly something on screen. "open", "select"… may also
+  // mean an app or a website.
+  const explicit = !!mode || /^(click|clique|clic|tap|press|hit|push|appuie|appuyer|tick|check|uncheck|untick|coche|decoche)$/.test(verb);
+  return t ? { target: t, targets: [...new Set([raw, t])], mode, state, explicit } : null;
 }
 
 // Menu bar items ("File", "Edit") only count when nothing in the window has that name.
@@ -58,7 +61,8 @@ export function byPosition(a, b) {
 
 /**
  * The elements a target names, best first:
- *   1. same name ("Jobs" = "Jobs", "Messaging 3" = "messaging", "Wi‑Fi" = "wifi", "&" = "and")
+ *   1. same name ("Jobs" = "Jobs", "Messaging 3" = "messaging", "Wi‑Fi" = "wifi", "&" = "and",
+ *      "notification" = "Notifications")
  *   2. otherwise a name that starts with the target's words ("Easy Apply" → "Easy Apply to Data Scientist")
  * When several remain, the ones in an open dialog, then the ones in view, win.
  * Returns { matches, exact }.
@@ -77,8 +81,9 @@ export function findTargets(target, elements = []) {
     const window = list.filter((e) => !isMenuBar(e));
     return window.length ? window : list;
   };
-  // "&" and "and" are the same when spoken ("Desktop & Dock"), and so are "Wi‑Fi" and "wifi".
-  const loose = (t) => t.replace(/\b(and|et)\b/g, ' ').replace(/\s+/g, '');
+  // "&" and "and" are the same when spoken ("Desktop & Dock"), and so are "Wi‑Fi" and "wifi",
+  // and singular and plural (silent in French: "notification" = "Notifications").
+  const loose = (t) => t.replace(/\b(and|et)\b/g, ' ').replace(/(\w{3,}?)[sx]\b/g, '$1').replace(/\s+/g, '');
   const said = loose(target);
   let matches = pick(labelled.filter((e) => nameOf(e.label) === target || normalize(e.label) === target));
   if (!matches.length) matches = pick(labelled.filter((e) => loose(nameOf(e.label)) === said || loose(normalize(e.label)) === said));

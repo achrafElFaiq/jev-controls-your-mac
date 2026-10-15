@@ -31,6 +31,7 @@ async function doctor({ prompt = false } = {}) {
   const perms = await desktop.permissions(prompt);
   desktop.close();
   const row = (ok, label, hint) => console.log(`${ok ? c.green('✓') : c.red('✗')} ${label}${ok ? '' : c.dim(`  → ${hint}`)}`);
+  console.log(`${config.jevKey ? c.green('✓') : c.dim('–')} Jev ${c.dim(config.jevKey ? 'understands what you meant when the exact words aren\'t found' : 'no key: only exact commands and names work (set jevKey in ~/.jev/config.json)')}`);
   row(perms.accessibility, 'Accessibility permission', 'System Settings → Privacy & Security → Accessibility → enable your terminal app');
   row(perms.microphone !== 'denied', `Microphone (${perms.microphone})`, 'System Settings → Privacy & Security → Microphone');
   row(perms.speech !== 'denied', `Speech recognition (${perms.speech})`, 'System Settings → Privacy & Security → Speech Recognition');
@@ -60,7 +61,7 @@ function createCommander({ config, desktop, speaker, answers }) {
   return new Commander({ desktop, ui, config });
 }
 
-const timing = (r) => `[${r.status} · ${r.op ?? 'unknown'} · ${(r.totalMs / 1000).toFixed(2)}s · action ${(r.actionMs / 1000).toFixed(2)}s]`;
+const timing = (r) => `[${r.status} · ${r.op ?? 'unknown'}${r.path === 'jev' ? ` (jev${r.understood?.early ? ', ready early' : ''})` : ''} · ${(r.totalMs / 1000).toFixed(2)}s${r.jevMs ? ` · jev ${(r.jevMs / 1000).toFixed(2)}s` : ''} · action ${(r.actionMs / 1000).toFixed(2)}s]`;
 
 async function interactive({ voice }) {
   const config = await loadConfig();
@@ -136,6 +137,13 @@ async function interactive({ voice }) {
         onUtterance(text);
       }, Math.max(0, earlyMs - (Date.now() - partial.at)));
     };
+    // Words that need Jev are sent to it as soon as they stop changing for a moment, so its
+    // answer is ready when the user stops speaking.
+    let speculateTimer = null;
+    const speculateSoon = () => {
+      clearTimeout(speculateTimer);
+      if (partial) speculateTimer = setTimeout(() => partial && commander.speculate(partial.text), 150);
+    };
     desktop.on('partial', ({ text }) => {
       if (speaker.speaking) return;
       stdout.write(`\r\x1b[2K${c.dim(text)}`);
@@ -143,12 +151,15 @@ async function interactive({ voice }) {
       // Read the screen while the user is still talking, unless it's a fixed command.
       if (!commander.fixed(text)) commander.prefetch();
       considerEarly();
+      speculateSoon();
     });
+    // Jev's answer arrived while the user is still speaking: maybe it can run now.
+    commander.onUnderstood = () => { if (partial) considerEarly(); };
     // Names on screen are words the recognizer should expect ("Candidature simplifiée").
     const baseHints = speechHints(await commander.installedApps());
     let lastHints = '';
     commander.onScreen = (screen) => {
-      if (partial) considerEarly(); // the screen arrived after the last words
+      if (partial) { considerEarly(); speculateSoon(); } // the screen arrived after the last words
       const labels = [...new Set((screen.elements ?? []).map((e) => e.label).filter((l) => l && l.length <= 40))].slice(0, 150);
       const key = labels.join('|');
       if (key === lastHints) return;
